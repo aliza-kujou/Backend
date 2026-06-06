@@ -4,6 +4,7 @@ const jwt = require('jsonwebtoken');
 const fs = require('fs');
 const path = require('path');
 const { Server } = require('ws');
+const crypto = require('crypto');
 
 const app = express();
 app.use(express.json());
@@ -48,7 +49,8 @@ const reglasPaises = {
     "TT": { prefijo: "+1868", sufijos: ["55"], digitos: 5 }
 };
 
-const clientesConectados = new Map();
+const sesionesActivas = new Map();
+const codigosVinculacion = new Map();
 
 function leerUsuarios() {
     return JSON.parse(fs.readFileSync(DB_FILE, 'utf-8'));
@@ -93,7 +95,7 @@ app.post('/api/auth/register', (req, res) => {
     };
     guardarUsuarios(usuarios);
 
-    const token = jwt.sign({ phone: numeroVirtual, jid: usuarios[numeroVirtual].jid }, JWT_SECRET, { expiresIn: '30d' });
+    const token = jwt.sign({ phone: numeroVirtual, jid: usuarios[numeroVirtual].jid, device: 'principal' }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ success: true, phone: numeroVirtual, jid: usuarios[numeroVirtual].jid, token });
 });
 
@@ -104,8 +106,14 @@ app.post('/api/auth/login', (req, res) => {
     const usuario = usuarios[phone];
     if (!usuario || usuario.password !== password) return res.status(401).json({ error: 'Credenciales invalidas' });
     
-    const token = jwt.sign({ phone, jid: usuario.jid }, JWT_SECRET, { expiresIn: '30d' });
+    const token = jwt.sign({ phone, jid: usuario.jid, device: 'principal' }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ success: true, phone, jid: usuario.jid, token });
+});
+
+app.post('/api/auth/request-pair', (req, res) => {
+    const code = crypto.randomBytes(4).toString('hex').toUpperCase();
+    codigosVinculacion.set(code, { status: 'pending', ws: null, expires: Date.now() + 300000 });
+    res.json({ code });
 });
 
 const server = app.listen(PORT, () => {
@@ -115,22 +123,57 @@ const server = app.listen(PORT, () => {
 const wss = new Server({ server });
 
 wss.on('connection', (ws) => {
-    let usuarioAutenticado = null;
+    let cuentaJid = null;
+    let dispositivoId = null;
 
     ws.on('message', (message) => {
         const dataStr = message.toString();
 
-        if (!usuarioAutenticado) {
+        if (!cuentaJid) {
             try {
-                const authData = JSON.parse(dataStr);
-                if (authData.type === 'auth' && authData.token) {
-                    const decoded = jwt.verify(authData.token, JWT_SECRET);
-                    usuarioAutenticado = decoded.jid;
-                    clientesConectados.set(usuarioAutenticado, ws);
-                    ws.send(JSON.stringify({ type: 'status', status: 'connected', jid: usuarioAutenticado }));
-                } else {
-                    ws.close();
+                const packet = JSON.parse(dataStr);
+                
+                if (packet.type === 'auth' && packet.token) {
+                    const decoded = jwt.verify(packet.token, JWT_SECRET);
+                    cuentaJid = decoded.jid;
+                    dispositivoId = decoded.device || 'web-' + Math.random().toString(36).substring(7);
+                    
+                    if (!sesionesActivas.has(cuentaJid)) {
+                        sesionesActivas.set(cuentaJid, new Map());
+                    }
+                    sesionesActivas.get(cuentaJid).set(dispositivoId, ws);
+                    
+                    ws.send(JSON.stringify({ type: 'status', status: 'connected', jid: cuentaJid, device: dispositivoId }));
+                    return;
                 }
+
+                if (packet.type === 'pair_listen' && packet.code) {
+                    const pair = codigosVinculacion.get(packet.code);
+                    if (pair && pair.status === 'pending' && pair.expires > Date.now()) {
+                        pair.ws = ws;
+                        return;
+                    }
+                    ws.close();
+                    return;
+                }
+
+                if (packet.type === 'pair_authorize' && packet.code && packet.token) {
+                    const decoded = jwt.verify(packet.token, JWT_SECRET);
+                    const pair = codigosVinculacion.get(packet.code);
+                    if (pair && pair.status === 'pending' && pair.expires > Date.now()) {
+                        const nuevoDevice = 'linked-' + Math.random().toString(36).substring(7);
+                        const nuevoToken = jwt.sign({ phone: decoded.phone, jid: decoded.jid, device: nuevoDevice }, JWT_SECRET, { expiresIn: '30d' });
+                        
+                        if (pair.ws && pair.ws.readyState === 1) {
+                            pair.ws.send(JSON.stringify({ type: 'pair_success', token: nuevoToken, jid: decoded.jid }));
+                        }
+                        codigosVinculacion.delete(packet.code);
+                        ws.send(JSON.stringify({ type: 'pair_authorized' }));
+                    }
+                    return;
+                }
+                
+                ws.close();
             } catch (err) {
                 ws.close();
             }
@@ -139,17 +182,34 @@ wss.on('connection', (ws) => {
 
         const matchTo = dataStr.match(/to=['"]([^'"]+)['"]/);
         if (matchTo) {
-            const destinatarioJid = matchTo[1];
-            const wsDestino = clientesConectados.get(destinatarioJid);
-            if (wsDestino && wsDestino.readyState === 1) {
-                wsDestino.send(dataStr);
+            let destinatarioJid = matchTo[1];
+            if (destinatarioJid.includes('/')) {
+                destinatarioJid = destinatarioJid.split('/')[0];
+            }
+            
+            const dispositivosDestino = sesionesActivas.get(destinatarioJid);
+            if (dispositivosDestino) {
+                for (const [id, wsDestino] of dispositivosDestino.entries()) {
+                    if (wsDestino.readyState === 1) {
+                        wsDestino.send(dataStr);
+                    }
+                }
             }
         }
     });
 
     ws.on('close', () => {
-        if (usuarioAutenticado) {
-            clientesConectados.delete(usuarioAutenticado);
+        if (cuentaJid && sesionesActivas.has(cuentaJid)) {
+            const m = sesionesActivas.get(cuentaJid);
+            m.delete(dispositivoId);
+            if (m.size === 0) {
+                sesionesActivas.delete(cuentaJid);
+            }
+        }
+        for (const [code, pair] of codigosVinculacion.entries()) {
+            if (pair.ws === ws) {
+                codigosVinculacion.delete(code);
+            }
         }
     });
 });
