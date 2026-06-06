@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const fs = require('fs');
 const path = require('path');
@@ -9,6 +10,7 @@ const bcrypt = require('bcrypt');
 
 const app = express();
 app.use(express.json());
+app.use(cors());
 
 const PORT = process.env.PORT || 8080;
 const JWT_SECRET = process.env.JWT_SECRET || 'kazuma_secret_fallback_key';
