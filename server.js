@@ -3,6 +3,7 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const fs = require('fs');
 const path = require('path');
+const { Server } = require('ws');
 
 const app = express();
 app.use(express.json());
@@ -47,6 +48,8 @@ const reglasPaises = {
     "TT": { prefijo: "+1868", sufijos: ["55"], digitos: 5 }
 };
 
+const clientesConectados = new Map();
+
 function leerUsuarios() {
     return JSON.parse(fs.readFileSync(DB_FILE, 'utf-8'));
 }
@@ -68,12 +71,9 @@ function generarNumeroVirtual(codigoPais) {
 
 app.post('/api/auth/register', (req, res) => {
     const { pais, password, alias } = req.body;
-    if (!pais || !password) {
-        return res.status(400).json({ error: 'Faltan datos requeridos' });
-    }
-    if (!reglasPaises[pais.toUpperCase()]) {
-        return res.status(400).json({ error: 'Pais no soportado o excluido' });
-    }
+    if (!pais || !password) return res.status(400).json({ error: 'Faltan datos' });
+    if (!reglasPaises[pais.toUpperCase()]) return res.status(400).json({ error: 'Pais no soportado' });
+    
     const usuarios = leerUsuarios();
     let numeroVirtual = "";
     let intentos = 0;
@@ -82,14 +82,12 @@ app.post('/api/auth/register', (req, res) => {
         intentos++;
     } while (usuarios[numeroVirtual] && intentos < 10);
 
-    if (usuarios[numeroVirtual]) {
-        return res.status(500).json({ error: 'No se pudo generar un numero unico' });
-    }
+    if (usuarios[numeroVirtual]) return res.status(500).json({ error: 'Error unico' });
 
     usuarios[numeroVirtual] = {
         jid: `${numeroVirtual}@chat.kazuma.app`,
         password: password,
-        alias: alias || 'Usuario',
+        alias: alias || 'Usuario Kazuma',
         bio: '¡Hola! Estoy usando Kazuma Chat.',
         created_at: Date.now()
     };
@@ -101,18 +99,57 @@ app.post('/api/auth/register', (req, res) => {
 
 app.post('/api/auth/login', (req, res) => {
     const { phone, password } = req.body;
-    if (!phone || !password) {
-        return res.status(400).json({ error: 'Faltan credenciales' });
-    }
+    if (!phone || !password) return res.status(400).json({ error: 'Faltan credenciales' });
     const usuarios = leerUsuarios();
     const usuario = usuarios[phone];
-    if (!usuario || usuario.password !== password) {
-        return res.status(401).json({ error: 'Credenciales invalidas' });
-    }
+    if (!usuario || usuario.password !== password) return res.status(401).json({ error: 'Credenciales invalidas' });
+    
     const token = jwt.sign({ phone, jid: usuario.jid }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ success: true, phone, jid: usuario.jid, token });
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
     console.log(`Servidor de Kazuma corriendo en puerto ${PORT}`);
+});
+
+const wss = new Server({ server });
+
+wss.on('connection', (ws) => {
+    let usuarioAutenticado = null;
+
+    ws.on('message', (message) => {
+        const dataStr = message.toString();
+
+        if (!usuarioAutenticado) {
+            try {
+                const authData = JSON.parse(dataStr);
+                if (authData.type === 'auth' && authData.token) {
+                    const decoded = jwt.verify(authData.token, JWT_SECRET);
+                    usuarioAutenticado = decoded.jid;
+                    clientesConectados.set(usuarioAutenticado, ws);
+                    ws.send(JSON.stringify({ type: 'status', status: 'connected', jid: usuarioAutenticado }));
+                } else {
+                    ws.close();
+                }
+            } catch (err) {
+                ws.close();
+            }
+            return;
+        }
+
+        const matchTo = dataStr.match(/to=['"]([^'"]+)['"]/);
+        if (matchTo) {
+            const destinatarioJid = matchTo[1];
+            const wsDestino = clientesConectados.get(destinatarioJid);
+            if (wsDestino && wsDestino.readyState === 1) {
+                wsDestino.send(dataStr);
+            }
+        }
+    });
+
+    ws.on('close', () => {
+        if (usuarioAutenticado) {
+            clientesConectados.delete(usuarioAutenticado);
+        }
+    });
 });
