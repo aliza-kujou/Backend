@@ -89,7 +89,7 @@ app.post('/api/auth/register', (req, res) => {
     usuarios[numeroVirtual] = {
         jid: `${numeroVirtual}@chat.kazuma.app`,
         password: password,
-        alias: alias || 'Usuario Kazuma',
+        alias: alias || 'Usuario',
         bio: '¡Hola! Estoy usando Kazuma Chat.',
         created_at: Date.now()
     };
