@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const { Server } = require('ws');
 const crypto = require('crypto');
+const bcrypt = require('bcrypt');
 
 const app = express();
 app.use(express.json());
@@ -14,7 +15,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'kazuma_secret_fallback_key';
 const DB_FILE = path.join(__dirname, 'users.json');
 
 if (!fs.existsSync(DB_FILE)) {
-    fs.writeFileSync(DB_FILE, JSON.stringify({}));
+    fs.writeFileSync(DB_FILE, JSON.stringify({ usuarios: {}, mensajesOffline: {} }));
 }
 
 const reglasPaises = {
@@ -52,12 +53,12 @@ const reglasPaises = {
 const sesionesActivas = new Map();
 const codigosVinculacion = new Map();
 
-function leerUsuarios() {
+function leerBaseDatos() {
     return JSON.parse(fs.readFileSync(DB_FILE, 'utf-8'));
 }
 
-function guardarUsuarios(usuarios) {
-    fs.writeFileSync(DB_FILE, JSON.stringify(usuarios, null, 2));
+function guardarBaseDatos(data) {
+    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
 }
 
 function generarNumeroVirtual(codigoPais) {
@@ -71,40 +72,46 @@ function generarNumeroVirtual(codigoPais) {
     return `${regla.prefijo}${sufijo}${restantes}`;
 }
 
-app.post('/api/auth/register', (req, res) => {
+app.post('/api/auth/register', async (req, res) => {
     const { pais, password, alias } = req.body;
     if (!pais || !password) return res.status(400).json({ error: 'Faltan datos' });
     if (!reglasPaises[pais.toUpperCase()]) return res.status(400).json({ error: 'Pais no soportado' });
     
-    const usuarios = leerUsuarios();
+    const db = leerBaseDatos();
     let numeroVirtual = "";
     let intentos = 0;
     do {
         numeroVirtual = generarNumeroVirtual(pais);
         intentos++;
-    } while (usuarios[numeroVirtual] && intentos < 10);
+    } while (db.usuarios[numeroVirtual] && intentos < 10);
 
-    if (usuarios[numeroVirtual]) return res.status(500).json({ error: 'Error unico' });
+    if (db.usuarios[numeroVirtual]) return res.status(500).json({ error: 'Error unico' });
 
-    usuarios[numeroVirtual] = {
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    db.usuarios[numeroVirtual] = {
         jid: `${numeroVirtual}@chat.kazuma.app`,
-        password: password,
+        password: hashedPassword,
         alias: alias || 'Usuario Kazuma',
         bio: '¡Hola! Estoy usando Kazuma Chat.',
         created_at: Date.now()
     };
-    guardarUsuarios(usuarios);
+    guardarBaseDatos(db);
 
-    const token = jwt.sign({ phone: numeroVirtual, jid: usuarios[numeroVirtual].jid, device: 'principal' }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ success: true, phone: numeroVirtual, jid: usuarios[numeroVirtual].jid, token });
+    const token = jwt.sign({ phone: numeroVirtual, jid: db.usuarios[numeroVirtual].jid, device: 'principal' }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ success: true, phone: numeroVirtual, jid: db.usuarios[numeroVirtual].jid, token });
 });
 
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
     const { phone, password } = req.body;
     if (!phone || !password) return res.status(400).json({ error: 'Faltan credenciales' });
-    const usuarios = leerUsuarios();
-    const usuario = usuarios[phone];
-    if (!usuario || usuario.password !== password) return res.status(401).json({ error: 'Credenciales invalidas' });
+    
+    const db = leerBaseDatos();
+    const usuario = db.usuarios[phone];
+    if (!usuario) return res.status(401).json({ error: 'Credenciales invalidas' });
+    
+    const coinciden = await bcrypt.compare(password, usuario.password);
+    if (!coinciden) return res.status(401).json({ error: 'Credenciales invalidas' });
     
     const token = jwt.sign({ phone, jid: usuario.jid, device: 'principal' }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ success: true, phone, jid: usuario.jid, token });
@@ -129,10 +136,10 @@ wss.on('connection', (ws) => {
     ws.on('message', (message) => {
         const dataStr = message.toString();
 
-        if (!cuentaJid) {
-            try {
-                const packet = JSON.parse(dataStr);
-                
+        try {
+            const packet = JSON.parse(dataStr);
+
+            if (!cuentaJid) {
                 if (packet.type === 'auth' && packet.token) {
                     const decoded = jwt.verify(packet.token, JWT_SECRET);
                     cuentaJid = decoded.jid;
@@ -144,6 +151,15 @@ wss.on('connection', (ws) => {
                     sesionesActivas.get(cuentaJid).set(dispositivoId, ws);
                     
                     ws.send(JSON.stringify({ type: 'status', status: 'connected', jid: cuentaJid, device: dispositivoId }));
+                    
+                    const db = leerBaseDatos();
+                    if (db.mensajesOffline && db.mensajesOffline[cuentaJid] && db.mensajesOffline[cuentaJid].length > 0) {
+                        db.mensajesOffline[cuentaJid].forEach((msg) => {
+                            ws.send(JSON.stringify(msg));
+                        });
+                        db.mensajesOffline[cuentaJid] = [];
+                        guardarBaseDatos(db);
+                    }
                     return;
                 }
 
@@ -174,27 +190,41 @@ wss.on('connection', (ws) => {
                 }
                 
                 ws.close();
-            } catch (err) {
-                ws.close();
+                return;
             }
-            return;
-        }
 
-        const matchTo = dataStr.match(/to=['"]([^'"]+)['"]/);
-        if (matchTo) {
-            let destinatarioJid = matchTo[1];
-            if (destinatarioJid.includes('/')) {
-                destinatarioJid = destinatarioJid.split('/')[0];
-            }
-            
-            const dispositivosDestino = sesionesActivas.get(destinatarioJid);
-            if (dispositivosDestino) {
-                for (const [id, wsDestino] of dispositivosDestino.entries()) {
-                    if (wsDestino.readyState === 1) {
-                        wsDestino.send(dataStr);
+            if (packet.type === 'message' && packet.to && packet.body) {
+                let destinatarioJid = packet.to;
+                if (destinatarioJid.includes('/')) {
+                    destinatarioJid = destinatarioJid.split('/')[0];
+                }
+
+                packet.from = cuentaJid;
+                packet.timestamp = Date.now();
+
+                const dispositivosDestino = sesionesActivas.get(destinatarioJid);
+                let entregado = false;
+
+                if (dispositivosDestino) {
+                    for (const [id, wsDestino] of dispositivosDestino.entries()) {
+                        if (wsDestino.readyState === 1) {
+                            wsDestino.send(JSON.stringify(packet));
+                            entregado = true;
+                        }
                     }
                 }
+
+                if (!entregado) {
+                    const db = leerBaseDatos();
+                    if (!db.mensajesOffline) db.mensajesOffline = {};
+                    if (!db.mensajesOffline[destinatarioJid]) db.mensajesOffline[destinatarioJid] = [];
+                    db.mensajesOffline[destinatarioJid].push(packet);
+                    guardarBaseDatos(db);
+                }
             }
+
+        } catch (err) {
+            if (!cuentaJid) ws.close();
         }
     });
 
